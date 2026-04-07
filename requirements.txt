@@ -1,10 +1,8 @@
-# Python 3.10+ required (Streamlit 1.52.x and LangChain 1.2.x do not support 3.9).
-streamlit==1.52.2
-pdfplumber==0.11.8
-langchain==1.2.0
-langchain-anthropic==0.3.13
-langchain-community==0.4.1
-langchain-core==1.2.5
-langchain-text-splitters==1.1.0
-faiss-cpu==1.13.2
-sentence-transformers==3.4.1
+streamlit
+pdfplumber
+langchain
+langchain-anthropic
+langchain-community
+langchain-text-splitters
+faiss-cpu
+sentence-transformers
