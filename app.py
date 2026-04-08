@@ -1,4 +1,6 @@
 import os
+import requests
+import random
 from typing import Optional
 
 import pdfplumber
@@ -11,6 +13,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# --- CONFIG & MIRO HELPERS ---
+MIRO_AUTH_URL = "https://miro.com/oauth/authorize"
+MIRO_TOKEN_URL = "https://api.miro.com/v1/oauth/token"
+# Make sure this matches exactly what you put in the Miro Developer Console
+REDIRECT_URI = "http://localhost:8501/"if st.get_option("server.address") == "localhost" else "https://ai-project-xko35uwkou6asd6hfucnvv.streamlit.app/"
 
 def get_anthropic_api_key() -> Optional[str]:
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -20,6 +27,54 @@ def get_anthropic_api_key() -> Optional[str]:
     except (FileNotFoundError, KeyError, TypeError):
         return None
 
+def exchange_code_for_token(auth_code: str):
+    """Exchanges Miro auth code for an access token."""
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": st.secrets["MIRO_CLIENT_ID"],
+        "client_secret": st.secrets["MIRO_CLIENT_SECRET"],
+        "code": auth_code,
+        "redirect_uri": REDIRECT_URI
+    }
+    response = requests.post(MIRO_TOKEN_URL, data=data)
+    if response.status_code == 200:
+        return response.json().get("access_token")
+    return None
+
+def push_to_miro_doc(token: str, board_id: str, content: str, question: str):
+    """Creates a Miro Doc using the correct v2 REST parameters."""
+    url = f"https://api.miro.com/v2/boards/{board_id}/docs"
+    
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+    
+    # Randomize position
+    random_x = random.randint(-1000, 1000)
+    random_y = random.randint(-1000, 1000)
+    
+    # CLEANED PAYLOAD: Title is moved INSIDE the content string
+    payload = {
+        "data": {
+            "contentType": "markdown",
+            "content": f"# Analysis: {question}\n\n{content}" # Title goes here!
+        },
+        "position": {
+            "x": random_x,
+            "y": random_y,
+            "origin": "center"
+        }
+    }
+    
+    response = requests.post(url, json=payload, headers=headers)
+    
+    if response.status_code != 201:
+        # This will help you see if there are other parameters Miro dislikes
+        st.error(f"Miro Error {response.status_code}: {response.text}")
+        
+    return response.status_code == 201
 
 @st.cache_resource
 def get_embeddings():
@@ -29,93 +84,102 @@ def get_embeddings():
         encode_kwargs={"normalize_embeddings": True},
     )
 
+# --- APP UI ---
+# DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
+st.header("AI PDF Analyst + Miro")
 
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
-
-st.header("My First Chatbot")
+# --- MIRO OAUTH LOGIC ---
+# Detect if user is returning from Miro with an auth code
+if "code" in st.query_params and "miro_token" not in st.session_state:
+    with st.spinner("Finalizing Miro connection..."):
+        token = exchange_code_for_token(st.query_params["code"])
+        if token:
+            st.session_state.miro_token = token
+            st.toast("Connected to Miro!")
+            # Clear the code from URL for a clean look
+            st.query_params.clear()
 
 with st.sidebar:
-    st.title("Your Documents")
-    file = st.file_uploader("Upload a PDF file and start asking questions", type="pdf")
-    st.caption(
-        "Answers use **Claude** (Anthropic). Search uses a **local** embedding model "
-        "(no extra API key; first run downloads ~80MB)."
-    )
+    st.title("Settings")
+    
+    # Miro Section
+    st.subheader("Miro Integration")
+    if "miro_token" not in st.session_state:
+        auth_link = f"{MIRO_AUTH_URL}?response_type=code&client_id={st.secrets['MIRO_CLIENT_ID']}&redirect_uri={REDIRECT_URI}"
+        st.link_button("🔐 Connect Miro Account", auth_link)
+    else:
+        st.success("✅ Miro Connected")
+        st.session_state.board_id = st.text_input("Board ID", placeholder="Paste Board ID here...")
+        if st.button("Log out of Miro"):
+            del st.session_state.miro_token
+            st.rerun()
 
+    st.divider()
+    st.title("Your Documents")
+    file = st.file_uploader("Upload a PDF file", type="pdf")
+    st.caption("Answers use **Claude 4.6**. Search uses a **local** embedding model.")
+
+# --- CORE LOGIC ---
 api_key = get_anthropic_api_key()
+
 if not api_key:
-    st.warning(
-        "Set your Claude API key: `export ANTHROPIC_API_KEY='...'` before running, "
-        "or add `ANTHROPIC_API_KEY = \"...\"` to `.streamlit/secrets.toml`."
-    )
+    st.warning("Please set your ANTHROPIC_API_KEY in secrets.toml.")
 
 if file is not None and api_key:
+    # PDF Processing (Existing logic)
     with pdfplumber.open(file) as pdf:
-        text = ""
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            text += (page_text or "") + "\n"
+        text = "".join([(page.extract_text() or "") + "\n" for page in pdf.pages]).strip()
 
-    text = text.strip()
     if not text:
-        st.error("No text could be extracted from this PDF. Try another file or a text-based PDF.")
+        st.error("No text found in PDF.")
     else:
-        text_splitter = RecursiveCharacterTextSplitter(
-            separators=["\n\n", "\n", ". ", " ", ""],
-            chunk_size=1000,
-            chunk_overlap=200,
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(text)
-        if not chunks:
-            st.error("Could not split the document into chunks.")
-        else:
-            with st.spinner("Indexing document (embeddings)…"):
-                vector_store = FAISS.from_texts(chunks, get_embeddings())
+        
+        with st.spinner("Indexing document..."):
+            vector_store = FAISS.from_texts(chunks, get_embeddings())
+            retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 4})
 
-            user_question = st.text_input("Type your question here")
+        user_question = st.text_input("Ask a question about the document:")
 
-            def format_docs(docs):
-                return "\n\n".join(doc.page_content for doc in docs)
+        if user_question:
+            llm = ChatAnthropic(model=DEFAULT_CLAUDE_MODEL, temperature=0.3, api_key=api_key)
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a helpful assistant. Context: {context}"),
+                ("human", "{question}")
+            ])
+            chain = ({"context": retriever | (lambda docs: "\n\n".join(d.page_content for d in docs)), 
+                      "question": RunnablePassthrough()} | prompt | llm | StrOutputParser())
 
-            retriever = vector_store.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": 4},
-            )
+            with st.spinner("Thinking..."):
+                response = chain.invoke(user_question)
+            
+            st.markdown(f"### Answer\n{response}")
 
-            claude_model = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip()
-            llm = ChatAnthropic(
-                model=claude_model,
-                temperature=0.3,
-                max_tokens=1000,
-                api_key=api_key,
-            )
-
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are a helpful assistant answering questions about a PDF document.\n\n"
-                        "Guidelines:\n"
-                        "1. Provide complete, well-explained answers using the context below.\n"
-                        "2. Include relevant details, numbers, and explanations to give a thorough response.\n"
-                        "3. If the context mentions related information, include it to give fuller picture.\n"
-                        "4. Only use information from the provided context - do not use outside knowledge.\n"
-                        "5. Summarize long information, ideally in bullets where needed\n"
-                        "6. If the information is not in the context, say so politely.\n\n"
-                        "Context:\n{context}",
-                    ),
-                    ("human", "{question}"),
-                ]
-            )
-
-            chain = (
-                {"context": retriever | format_docs, "question": RunnablePassthrough()}
-                | prompt
-                | llm
-                | StrOutputParser()
-            )
-
-            if user_question:
-                with st.spinner("Thinking…"):
-                    response = chain.invoke(user_question)
-                st.write(response)
+            # --- MIRO PUSH BUTTON (ROBUST VERSION) ---
+if "miro_token" in st.session_state:
+    # Scenario A: Logged in and has a Board ID
+    if st.session_state.get("board_id"):
+        if st.button("📄 Push to Miro as Doc"):
+            with st.spinner("Creating Miro Doc..."):
+                # We pass the token, cleaned board_id, the AI response, and the original question
+                success = push_to_miro_doc(
+                    st.session_state.miro_token, 
+                    st.session_state.board_id, 
+                    response,
+                    user_question
+                )
+                
+                if success:
+                    st.success("Analysis Doc created on Miro!")
+                else:
+                    st.error("Failed to push. Check your Board ID and Permissions in Miro Console.")
+    
+    # Scenario B: Logged in but FORGOT the Board ID
+    else:
+        st.info("💡 Paste a Board ID in the sidebar to push this analysis to Miro.")
+        
+else:
+    # Scenario C: Not logged in at all
+    st.warning("🔐 Connect your Miro account in the sidebar to export this to a board.")
